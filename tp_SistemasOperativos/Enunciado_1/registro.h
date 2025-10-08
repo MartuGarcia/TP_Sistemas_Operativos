@@ -6,7 +6,7 @@
 #define LLAVE_BUF 0x1234
 #define LLAVE_CTRL 0x5678
 
-#define ELEMENTOS_BUF 16     // tamaño del buffer circular en SHM (ajustable)
+#define ELEMENTOS_BUF 128     // tamaño del buffer circular en SHM (ajustable)
 #define REGS_A_LEER 10       // bloque solicitado por productor (debe ser 10 según consigna)
 #define MAX_PRODS 64         // número máximo de productores soportados
 #define MAX_RECYCLE 256      // cantidad máxima de bloques reciclados
