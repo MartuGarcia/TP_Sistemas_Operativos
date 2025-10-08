@@ -43,6 +43,14 @@ static int sem_post_retry(sem_t *s){
     return rc;
 }
 
+/* sleep breve (ms) usando nanosleep para evitar warnings de usleep) */
+static void sleep_ms(long ms){
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+
 void cleanup_ipc_and_exit(int status){
     if(child_pids){
         for(int i=0;i<cantProcs_glob;i++){
@@ -179,11 +187,12 @@ int productor_func(int idx){
             if(!placed){
                 /* devolver espacio y reintentar */
                 sem_post_retry(sEsp);
-                usleep(1000);
+                sleep_ms(1); /* 1 ms */
                 k--; /* reintentar mismo id */
                 continue;
             }
             sem_post_retry(sMsg);
+            /* nota: cuidado con producción masiva de printf en ejecuciones grandes */
             printf("[P%d] puso ID %d en buffer\n", idx+1, id_actual);
         }
 
@@ -296,13 +305,17 @@ int main(int argc, char *argv[]){
 
     /* inicializar buffer y control */
     for(int i=0;i<ELEMENTOS_BUF;i++) buf[i].id = 0;
+
+    /* Inicialización determinista de control */
     memset(ctrl,0,sizeof(Control));
     ctrl->next_id = 1;
     ctrl->remaining = totalIds;
     ctrl->recycle_count = 0;
-    for(int i=0;i<cantProcs;i++){
+    for(int i=0;i<MAX_PRODS;i++){
         ctrl->requests[i] = 0;
         ctrl->bloques[i].asignado = 0;
+        ctrl->bloques[i].cantidad = 0;
+        ctrl->bloques[i].start = 0;
     }
 
     /* preparar archivo CSV y escribir cabecera */
@@ -394,89 +407,106 @@ int main(int argc, char *argv[]){
                     }
                 }
             }
-            /* si ya no hay productores activos y no hay mensajes en buffer y no quedan solicitudes -> salir temprano */
+            /* si ya no hay productores activos -> decidir si terminar o seguir consumiendo */
             if(active_producers == 0){
-                int sval=0;
-                sem_getvalue(semMsgBuf,&sval);
-                if(sval == 0){
-                    fprintf(stderr,"No quedan productores activos y buffer vacío: terminando antes de completar todos los registros.\n");
+                if(ctrl->remaining <= 0){
+                    int sval = 0;
+                    sem_getvalue(semMsgBuf, &sval); /* solo informativo */
+                    if(sval == 0){
+                        fprintf(stderr,"No quedan productores activos y no quedan IDs por asignar ni mensajes en buffer: terminar.\n");
+                        break;
+                    } else {
+                        /* hay mensajes en buffer: dejemos que el bucle principal los consuma */
+                        fprintf(stderr,"No quedan productores activos, pero hay %d mensajes pendientes; procesando hasta vaciar buffer.\n", sval);
+                    }
+                } else {
+                    /* quedan IDs por asignar pero no hay productores: esto solo puede pasar si no reciclaron o hubo inconsistencias.
+                       En este caso, romper no tiene sentido porque nadie podrá producir esos IDs; mejor avisar y salir. */
+                    fprintf(stderr,"Advertencia: no quedan productores activos pero quedan %d IDs por asignar: saliendo.\n", ctrl->remaining);
                     break;
                 }
             }
         }
 
         /* ===== servicio de solicitudes pendientes (no bloqueante) ===== */
-int found_idx = -1;
-/* procesar *todas* las solicitudes pendientes con trywait */
-while( sem_trywait(semSolicitudes) == 0 ){
-    /* buscar un productor que solicitó */
-    if( sem_wait_retry(semIDs) == -1 ){ perror("sem_wait semIDs"); break; }
-    found_idx = -1;
-    for(int i=0;i<cantProcs;i++){
-        if(ctrl->requests[i]){
-            /* asignar si no tiene ya asignado */
-            found_idx = i;
-            ctrl->requests[i] = 0; // consumida la solicitud
+        int found_idx = -1;
+        /* procesar un número limitado de solicitudes por iteración para evitar busy-loop */
+        int processed = 0;
+        const int MAX_PROC_PER_ITER = 256;
+        while(processed < MAX_PROC_PER_ITER && sem_trywait(semSolicitudes) == 0 ){
+            processed++;
+            /* buscar un productor que solicitó */
+            if( sem_wait_retry(semIDs) == -1 ){ perror("sem_wait semIDs"); break; }
+            found_idx = -1;
+            for(int i=0;i<cantProcs;i++){
+                if(ctrl->requests[i]){
+                    /* asignar si no tiene ya asignado */
+                    found_idx = i;
+                    ctrl->requests[i] = 0; // consumida la solicitud
+                    break;
+                }
+            }
+
+            if(found_idx >= 0){
+                /* elegir bloque (preferir recycle) */
+                int use_start = 0, use_cant = 0;
+                if(pop_recycle(ctrl, &use_start, &use_cant) && use_cant>0){
+                    if(use_cant > REGS_A_LEER){
+                        int assigned = REGS_A_LEER;
+                        ctrl->bloques[found_idx].start = use_start;
+                        ctrl->bloques[found_idx].cantidad = assigned;
+                        ctrl->bloques[found_idx].asignado = 1;
+                        int rest_start = use_start + assigned;
+                        int rest_cant = use_cant - assigned;
+                        if(ctrl->recycle_count < MAX_RECYCLE){
+                            ctrl->recycle[ctrl->recycle_count].start = rest_start;
+                            ctrl->recycle[ctrl->recycle_count].cantidad = rest_cant;
+                            ctrl->recycle_count++;
+                        }
+                        ctrl->remaining -= assigned;
+                        fprintf(stderr, "[C] Asignado reciclado start=%d cant=%d a prod idx=%d (remaining=%d)\n", use_start, assigned, found_idx, ctrl->remaining);
+                    } else {
+                        ctrl->bloques[found_idx].start = use_start;
+                        ctrl->bloques[found_idx].cantidad = use_cant;
+                        ctrl->bloques[found_idx].asignado = 1;
+                        ctrl->remaining -= use_cant;
+                        fprintf(stderr, "[C] Asignado reciclado start=%d cant=%d a prod idx=%d (remaining=%d)\n", use_start, use_cant, found_idx, ctrl->remaining);
+                    }
+                } else {
+                    /* asignar desde next_id */
+                    if(ctrl->remaining <= 0){
+                        ctrl->bloques[found_idx].asignado = 0;
+                        ctrl->bloques[found_idx].cantidad = 0;
+                        ctrl->bloques[found_idx].start = 0;
+                    } else {
+                        int take = REGS_A_LEER;
+                        if(ctrl->remaining < take) take = ctrl->remaining;
+                        int start = ctrl->next_id;
+                        ctrl->next_id += take;
+                        ctrl->remaining -= take;
+                        ctrl->bloques[found_idx].start = start;
+                        ctrl->bloques[found_idx].cantidad = take;
+                        ctrl->bloques[found_idx].asignado = 1;
+                        fprintf(stderr, "[C] Asignado next_id start=%d cant=%d a prod idx=%d (remaining=%d)\n", start, take, found_idx, ctrl->remaining);
+                    }
+                }
+            }
+            sem_post_retry(semIDs);
+
+            /* avisar al productor asignado (si hubo) */
+            if(found_idx >= 0){
+                sem_post_retry( semRespuesta[found_idx] );
+            }
+        }
+        /* ===== fin servicio de solicitudes pendientes ===== */
+
+        /* Ahora: consumir 1 registro del buffer (bloqueante) */
+        if( sem_wait(semMsgBuf) == -1 ){
+            if(errno == EINTR) continue;
+            perror("sem_wait semMsgBuf");
             break;
         }
-    }
 
-    if(found_idx >= 0){
-        /* elegir bloque (preferir recycle) */
-        int use_start = 0, use_cant = 0;
-        if(pop_recycle(ctrl, &use_start, &use_cant) && use_cant>0){
-            if(use_cant > REGS_A_LEER){
-                int assigned = REGS_A_LEER;
-                ctrl->bloques[found_idx].start = use_start;
-                ctrl->bloques[found_idx].cantidad = assigned;
-                ctrl->bloques[found_idx].asignado = 1;
-                int rest_start = use_start + assigned;
-                int rest_cant = use_cant - assigned;
-                if(ctrl->recycle_count < MAX_RECYCLE){
-                    ctrl->recycle[ctrl->recycle_count].start = rest_start;
-                    ctrl->recycle[ctrl->recycle_count].cantidad = rest_cant;
-                    ctrl->recycle_count++;
-                }
-                ctrl->remaining -= assigned;
-            } else {
-                ctrl->bloques[found_idx].start = use_start;
-                ctrl->bloques[found_idx].cantidad = use_cant;
-                ctrl->bloques[found_idx].asignado = 1;
-                ctrl->remaining -= use_cant;
-            }
-        } else {
-            /* asignar desde next_id */
-            if(ctrl->remaining <= 0){
-                ctrl->bloques[found_idx].asignado = 0;
-                ctrl->bloques[found_idx].cantidad = 0;
-                ctrl->bloques[found_idx].start = 0;
-            } else {
-                int take = REGS_A_LEER;
-                if(ctrl->remaining < take) take = ctrl->remaining;
-                int start = ctrl->next_id;
-                ctrl->next_id += take;
-                ctrl->remaining -= take;
-                ctrl->bloques[found_idx].start = start;
-                ctrl->bloques[found_idx].cantidad = take;
-                ctrl->bloques[found_idx].asignado = 1;
-            }
-        }
-    }
-    sem_post_retry(semIDs);
-
-    /* avisar al productor asignado (si hubo) */
-    if(found_idx >= 0){
-        sem_post_retry( semRespuesta[found_idx] );
-    }
-}
-/* ===== fin servicio de solicitudes pendientes ===== */
-
-/* Ahora: consumir 1 registro del buffer (bloqueante) */
-if( sem_wait(semMsgBuf) == -1 ){
-    if(errno == EINTR) continue;
-    perror("sem_wait semMsgBuf");
-    break;
-}
         /* leer buffer (primer elemento no nulo) */
         if( sem_wait_retry(semBuf) == -1 ){ perror("sem_wait semBuf"); break; }
         Registro reg_copy;
