@@ -1,6 +1,6 @@
 #!/bin/bash
-# Ejecuta el tp con 3 productores y 50 registros de prueba
-./tp 3 50 &
+# Ejecuta el tp con 20 productores y 1500 registros de prueba
+./tp 20 1500 &
 TP_PID=$!
 echo "TP pid = $TP_PID"
 
